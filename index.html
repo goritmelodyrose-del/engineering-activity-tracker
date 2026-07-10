@@ -1552,7 +1552,7 @@ thead .zg-col-task,thead .zg-col-lead,thead .zg-col-progress,thead .zg-col-start
 <div id="print-area"></div>
 
 <!-- ═══ SUPABASE CDN ═══ -->
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4"></script>
 <script src="https://accounts.google.com/gsi/client"></script>
 
 <script>
@@ -1563,7 +1563,7 @@ thead .zg-col-task,thead .zg-col-lead,thead .zg-col-progress,thead .zg-col-start
      https://supabase.com/dashboard → Project Settings → API
 ═══════════════════════════════════════════════════════════ */
 const SUPABASE_URL  = 'https://brnckbykyagkdpakeeif.supabase.co';
-const SUPABASE_ANON = 'sb_publishable_nwh4s7E5N3_sg6Vnw_fu2A_b_TTcwhc';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJybmNrYnlreWFna2RwYWtlZWlmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1NTk2OTQsImV4cCI6MjA5OTEzNTY5NH0.RS5WmPqFOAoJlSjFE6ezReY8DgdrL1tBl2CBP5wJw74';
 
 const _supa = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
@@ -2443,7 +2443,27 @@ function _startSync(){
       if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'){
         _realtimeFailStreak = (_realtimeFailStreak||0) + 1;
         var detail = (err && (err.message||err.toString())) || status;
-        console.warn('Realtime channel problem ('+_realtimeFailStreak+' in a row):', detail);
+        /* Log the raw error too — a bare "CLOSED" with no err object tells
+           us almost nothing on its own, but the full object sometimes has
+           a nested reason (auth rejection code, close code, etc.) that
+           .message alone doesn't surface. */
+        console.warn('Realtime channel problem ('+_realtimeFailStreak+' in a row):', detail, err||'(no error object — likely a plain socket close)');
+        /* On the very first failure, run a one-time plain REST probe
+           against the same project using the same key. This tells us
+           whether the key/auth itself is bad (REST call also fails,
+           e.g. 401) vs. the key being fine and only the WebSocket/
+           realtime channel being blocked (REST succeeds, only this
+           fails) — e.g. a corporate proxy or firewall blocking wss://
+           while https:// still works fine. */
+        if(_realtimeFailStreak === 1){
+          fetch(SUPABASE_URL + '/rest/v1/tracker_data?select=id&limit=1', {
+            headers: { apikey: SUPABASE_ANON, Authorization: 'Bearer ' + SUPABASE_ANON }
+          }).then(function(r){
+            console.warn('Realtime REST probe (diagnostic only):', r.status, r.ok ? 'REST OK — key is valid, problem is WebSocket/realtime-specific' : 'REST FAILED — key/auth itself is the problem');
+          }).catch(function(e){
+            console.warn('Realtime REST probe failed to even reach the server:', e.message, '— likely a network/DNS/firewall issue, not a key problem');
+          });
+        }
         /* Back off after repeated failures instead of retrying every 1.5s
            forever — a fast infinite retry loop is exactly what makes a
            persistent problem (e.g. Realtime not enabled on the table, or
