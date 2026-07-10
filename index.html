@@ -1954,6 +1954,12 @@ async function downloadDriveOrLocalFiles(files){
 var _cloudReady  = false;
 var _sbSaving    = false;
 var _sbLastSave  = 0;
+var _sbSavePending = false; /* an edit arrived while a save was already in flight —
+                                flush it the instant the current save finishes instead
+                                of waiting for the next debounce/30s safety net */
+var _useRpcSave  = null;    /* null = not tested yet, true = fast single-round-trip
+                                path available, false = use the classic 2-step path.
+                                See the upsert_tracker_data_if_newer() SQL function. */
 var _lastLocalEdit = 0;
 var _autoSaveTmr = null;
 var _realtimeCh  = null;
@@ -2093,28 +2099,94 @@ async function saveToCloud(isRetry){
   /* Step 1: Always persist locally — even if cloud fails, data is safe */
   _lsSave();
 
-  if(_sbSaving && !isRetry) return;
+  if(_sbSaving && !isRetry){
+    /* A save is already in flight. Don't drop this edit on the floor —
+       previously it would just be silently skipped, and the only thing
+       that could push it to the cloud afterwards was the 30s safety-net
+       interval, which is exactly why sync could feel slow (edits made
+       in quick succession while a save was mid-flight could sit for up
+       to 30 seconds before other devices ever saw them). Instead, flag
+       it as pending so the in-flight save re-runs itself immediately —
+       typically well under a second later — the moment it's done. */
+    _sbSavePending = true;
+    return;
+  }
   if(!_cloudReady){
     _showStatus('💾 Saved locally (not connected)', 'var(--amber)');
     return;
   }
   _sbSaving = true;
+  _sbSavePending = false;
   _showStatus('⏳ Saving…', 'var(--amber)');
   try {
-    /* RECONCILE GUARD — check the cloud's current revision before
-       overwriting it. This is the critical safety check: it's what
-       stops a device that fell behind (e.g. a mobile tab that was
-       backgrounded and missed a realtime update) from blindly pushing
-       its stale snapshot over newer data another device already saved.
-       Every single save — periodic, manual, or auto — goes through
-       this check, so a stale push can never happen regardless of why
-       this device's revision fell behind.
+    /* Fast path: a single round trip that atomically checks-and-writes
+       in Postgres (see upsert_tracker_data_if_newer in the setup SQL).
+       Falls back automatically to the classic 2-request path below if
+       that SQL function hasn't been created in this Supabase project. */
+    if(_useRpcSave !== false){
+      const handled = await _saveToCloudViaRpc();
+      if(handled) return; // finally{} below still runs
+    }
+    await _saveToCloudLegacy();
+  } finally {
+    _sbSaving = false;
+    if(_sbSavePending){
+      _sbSavePending = false;
+      saveToCloud(); // flush immediately — don't make it wait for the next debounce
+    }
+  }
+}
 
-       EGRESS NOTE: we only ask Postgres for the tiny `_rev` number
-       inside the JSON (via the `->` operator), not the whole payload.
-       The full payload is only fetched in the rare case the cloud
-       actually turns out to be ahead — this avoids downloading the
-       entire dataset on every single save just to compare one integer. */
+/* Fast, single-round-trip save path. Returns true once it has fully
+   handled the save (success, adopted-newer, or a real error) — false
+   only when the SQL function itself doesn't exist yet, so the caller
+   knows to fall back to the legacy path. */
+async function _saveToCloudViaRpc(){
+  const payload = { acts, inventory, nid, calY, calM, isDark, projected, _rev, _savedAt: Date.now() };
+  try{
+    const { data, error } = await _supa.rpc('upsert_tracker_data_if_newer', {
+      p_id: 'main-data', p_payload: payload, p_rev: _rev
+    });
+    if(error){
+      const missing = error.code === 'PGRST202' || error.code === '42883' ||
+        /function .*upsert_tracker_data_if_newer.* does not exist/i.test(error.message||'');
+      if(missing){ _useRpcSave = false; return false; }
+      throw error;
+    }
+    _useRpcSave = true;
+    const row = Array.isArray(data) ? data[0] : data;
+    if(row && row.updated === false){
+      /* Cloud already had something newer — adopt it instead of overwriting */
+      var d = row.current_payload || {};
+      acts=d.acts||[]; inventory=d.inventory||[]; nid=d.nid||1;
+      calY=d.calY||calY; calM=d.calM||calM; isDark=d.isDark||isDark;
+      projected=d.projected||[];
+      _rev = d._rev || _rev; _lastSavedRev = _rev;
+      _lsSave(); renderAll();
+      _hideSaveErrorBanner();
+      _showStatus('🔄 Cloud had newer data — synced instead of overwriting', 'var(--blue)');
+    } else {
+      _sbLastSave = Date.now();
+      _lastSavedRev = _rev;
+      _hideSaveErrorBanner();
+      _showStatus('☁ Synced ' + new Date().toLocaleTimeString(), 'var(--green)');
+    }
+    return true;
+  }catch(e){
+    console.warn('Cloud save failed:', e.message, e);
+    _showStatus('⚠️ Cloud error — saved locally', 'var(--red)');
+    _showSaveErrorBanner('Cloud save failed — your data is kept safely on this device. Tap Retry.');
+    return true;
+  }
+}
+
+/* Classic 2-request path (select current rev, then upsert). Used
+   automatically until the upsert_tracker_data_if_newer SQL function is
+   added to the Supabase project — see the setup instructions provided
+   alongside this file. Functionally identical to the original save,
+   just factored out so it can serve as an automatic fallback. */
+async function _saveToCloudLegacy(){
+  try {
     const { data: curRev, error: checkErr } = await _supa
       .from('tracker_data')
       .select('payload->_rev')
@@ -2140,7 +2212,6 @@ async function saveToCloud(isRetry){
           _hideSaveErrorBanner();
           _showStatus('🔄 Cloud had newer data — synced instead of overwriting', 'var(--blue)');
         }
-        _sbSaving = false;
         return;
       }
     }
@@ -2160,7 +2231,7 @@ async function saveToCloud(isRetry){
     console.warn('Cloud save failed:', e.message, e);
     _showStatus('⚠️ Cloud error — saved locally', 'var(--red)');
     _showSaveErrorBanner('Cloud save failed — your data is kept safely on this device. Tap Retry.');
-  } finally { _sbSaving = false; }
+  }
 }
 
 /* ══════════════════════════════════════════
@@ -2472,7 +2543,7 @@ function initCloud(){
     setThisWeek();
     _cloudLoadLog(function(){
       _cloudReady = true;
-      _cloudLoadAdminUsers(function(){ renderAdminNamePicker(); });
+      _cloudLoadAdminUsers(function(){ renderAdminNamePicker(); _cloudLoadPinHashes(); });
       _startSync();
       /* Only render if user is already logged in */
       if(currentUser) renderAll();
@@ -2573,7 +2644,8 @@ let currentRole = null;   // 'admin' | 'viewer'
 let _pendingUser = null;
 let _pendingRole = null;  // role chosen at step 1
 const LOG_KEY = 'lean_tracker_loginlog_v1';
-const PIN_KEY_PREFIX = 'lean_pin_';
+const PIN_KEY_PREFIX = 'lean_pin_';           // legacy per-device key (read-only now, kept only for migration)
+const PIN_HASHES_CACHE_KEY = 'lean_pinhashes_cache_v1';
 let loginLog = [];
 
 /* ══════════════════════════════════════════
@@ -2708,7 +2780,9 @@ async function removeAdminUser(name){
   if(name === MAIN_ADMIN){ alert('The Main Admin cannot be removed.'); return; }
   if(!confirm('Remove '+name+' as an Admin? They will no longer be able to log in with Admin access.')) return;
   adminUsers = adminUsers.filter(u=>u.name !== name);
+  delete pinHashes[name];
   try{ localStorage.removeItem(PIN_KEY_PREFIX+name); }catch(e){}
+  await _cloudSavePinHashes();
   await _cloudSaveAdminUsers();
   renderManageAdminsList();
   renderAdminNamePicker();
@@ -2724,11 +2798,9 @@ async function renameAdminUser(oldName){
   if(!entry) return;
   entry.name = newName;
   entry.initials = _nameToInitials(newName);
-  /* carry the existing PIN over to the new name on this device */
-  try{
-    const oldPin = localStorage.getItem(PIN_KEY_PREFIX+oldName);
-    if(oldPin){ localStorage.setItem(PIN_KEY_PREFIX+newName, oldPin); localStorage.removeItem(PIN_KEY_PREFIX+oldName); }
-  }catch(e){}
+  /* carry the existing PIN hash over to the new name, everywhere (cloud-synced) */
+  if(pinHashes[oldName]){ pinHashes[newName] = pinHashes[oldName]; delete pinHashes[oldName]; }
+  await _cloudSavePinHashes();
   await _cloudSaveAdminUsers();
   renderManageAdminsList();
   renderAdminNamePicker();
@@ -2747,16 +2819,97 @@ async function _hashPin(pin){
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 
-/* ── PIN storage helpers ── */
+/* ══════════════════════════════════════════
+   PIN STORAGE — now synced through Supabase
+   ─────────────────────────────────────────
+   PINs used to live ONLY in localStorage
+   (PIN_KEY_PREFIX + name), so a PIN set on one
+   device was invisible on any other device —
+   opening the app on a phone for the first time
+   always looked like "no PIN yet" and forced a
+   brand-new PIN to be created there. The hashes
+   (never the raw PIN) now live in the same
+   `tracker_data` table, in a dedicated row
+   (id:'pin-hashes'), so every device shares the
+   same answer to "does this admin already have
+   a PIN, and what is its hash". A local cache is
+   still kept for instant, offline-friendly
+   lookups on devices that have already synced.
+══════════════════════════════════════════ */
+let pinHashes = {};                 // { adminName: sha256Hash }
+let _pinHashesReady = false;
+let _pinHashesWaiters = [];
+function _waitPinHashesReady(){
+  if(_pinHashesReady) return Promise.resolve();
+  return new Promise(function(res){ _pinHashesWaiters.push(res); });
+}
+function _markPinHashesReady(){
+  _pinHashesReady = true;
+  _pinHashesWaiters.forEach(function(r){ r(); });
+  _pinHashesWaiters = [];
+}
+function _loadPinHashesLocalCache(){
+  try{
+    const r = localStorage.getItem(PIN_HASHES_CACHE_KEY);
+    pinHashes = r ? JSON.parse(r) : {};
+  }catch(e){ pinHashes = {}; }
+}
+function _savePinHashesLocalCache(){
+  try{ localStorage.setItem(PIN_HASHES_CACHE_KEY, JSON.stringify(pinHashes)); }catch(e){}
+}
+/* Loads the shared PIN-hash table from the cloud. Also migrates any
+   OLD per-device PIN (set before this update existed) into the shared
+   table, so nobody who already set a PIN gets locked out — but only
+   for names the cloud doesn't already know about, so a PIN changed on
+   another device always wins over a stale local leftover. */
+async function _cloudLoadPinHashes(cb){
+  _loadPinHashesLocalCache();
+  let needsPush = false;
+  try{
+    const { data, error } = await _supa
+      .from('tracker_data')
+      .select('payload')
+      .eq('id', 'pin-hashes')
+      .maybeSingle();
+    const cloudHashes = (!error && data && data.payload && data.payload.hashes) ? data.payload.hashes : null;
+    if(cloudHashes){
+      pinHashes = Object.assign({}, pinHashes, cloudHashes);
+    }
+    // Migrate legacy per-device PINs for names the cloud (still) doesn't know about
+    (adminUsers||[]).forEach(function(u){
+      const known = cloudHashes && cloudHashes[u.name];
+      if(!known){
+        const legacy = localStorage.getItem(PIN_KEY_PREFIX + u.name);
+        if(legacy && pinHashes[u.name] !== legacy){ pinHashes[u.name] = legacy; needsPush = true; }
+      }
+    });
+  }catch(e){ console.warn('PIN cloud load failed, using local cache for now:', e.message); }
+  _savePinHashesLocalCache();
+  _markPinHashesReady();
+  if(needsPush) _cloudSavePinHashes();
+  if(cb) cb();
+}
+async function _cloudSavePinHashes(){
+  _savePinHashesLocalCache();
+  if(typeof _cloudReady === 'undefined' || !_cloudReady) return;
+  try{
+    await _supa.from('tracker_data').upsert({
+      id: 'pin-hashes',
+      payload: { hashes: pinHashes },
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'id' });
+  }catch(e){ console.warn('PIN cloud save failed:', e.message); }
+}
 function _hasSavedPin(name){
-  return !!localStorage.getItem(PIN_KEY_PREFIX + name);
+  return !!pinHashes[name];
 }
 function _getSavedPinHash(name){
-  return localStorage.getItem(PIN_KEY_PREFIX + name) || '';
+  return pinHashes[name] || '';
 }
 async function _savePin(name, pin){
   const hash = await _hashPin(pin);
-  localStorage.setItem(PIN_KEY_PREFIX + name, hash);
+  pinHashes[name] = hash;
+  await _cloudSavePinHashes();
 }
 
 /* ── Initials from a name string ── */
@@ -2794,11 +2947,21 @@ function chooseRole(role){
 /* ─────────────────────────────────────────
    STEP 2a: Admin name selected
 ───────────────────────────────────────── */
-function selectAdminUser(name, initials){
+async function selectAdminUser(name, initials){
   _pendingUser = name;
   _hide('step-admin-name');
   document.getElementById('pin-username').textContent = name;
   document.getElementById('set-pin-username').textContent = name;
+  /* If this device already knows the answer for this name (from its
+     local PIN-hash cache) decide instantly. Otherwise — e.g. the very
+     first time this admin logs in on this device — wait briefly for
+     the cloud's shared PIN table, so we don't wrongly show "create a
+     new PIN" just because this device hasn't synced yet. A short
+     timeout keeps things usable even if the device is offline. */
+  if(!_pinHashesReady && !(name in pinHashes)){
+    _showStatus('⏳ Checking your PIN…', 'var(--amber)');
+    await Promise.race([ _waitPinHashesReady(), new Promise(function(r){ setTimeout(r, 6000); }) ]);
+  }
   if(_hasSavedPin(name)){
     _showEnterPin(name);
   } else {
