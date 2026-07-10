@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Engineering Activity Tracker</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -2295,7 +2298,21 @@ function _startSync(){
         setTimeout(function(){ _showStatus('☁ Live', 'var(--green)'); }, 2000);
       }
     )
-    .subscribe();
+    .subscribe(function(status){
+      /* If the websocket errors out, times out, or gets closed (common
+         on mobile networks — carrier NAT timeouts, background throttling,
+         switching between wifi/cellular), automatically reconnect rather
+         than leaving this device silently stuck with a dead channel
+         until the user happens to background/reopen the tab. Also do an
+         immediate pull-reconcile so anything missed during the gap gets
+         picked up right away. */
+      if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'){
+        _showStatus('⚠️ Realtime reconnecting…', 'var(--amber)');
+        setTimeout(function(){ _reconcileFromCloud(true); _restartRealtime(); }, 1500);
+      } else if(status === 'SUBSCRIBED'){
+        _reconcileFromCloud(true);
+      }
+    });
 }
 
 /* Mobile browsers (and backgrounded desktop tabs) suspend or kill the
@@ -2478,6 +2495,20 @@ function initCloud(){
       }, 30000);
       /* Retry every 15s when cloud save has been failing */
       setInterval(function(){ if(_cloudReady && _cloudSaveFailed) saveToCloud(true); }, 15000);
+      /* FOREGROUND POLL FALLBACK — mobile browsers (Safari/Chrome on iOS
+         & Android especially) frequently freeze or silently drop the
+         realtime websocket while a tab just sits open in the
+         foreground, with no visibilitychange/offline event ever firing
+         to warn the app that it went stale. Relying on realtime +
+         reconnect-on-focus alone means a phone that's simply left open
+         can go quietly out of sync indefinitely. This cheap rev-only
+         check (same lightweight query _reconcileFromCloud already uses
+         for tab-focus/online reconnects) runs every 12s while the tab
+         is visible, so any silent drop gets caught within seconds
+         instead of only on the next backgrounding/refresh. */
+      setInterval(function(){
+        if(document.visibilityState === 'visible' && _cloudReady) _reconcileFromCloud(true);
+      }, 12000);
       document.addEventListener('keydown', function(e){
         /* PIN keyboard support — enter PIN screen */
         if(document.getElementById('pin-screen') &&
