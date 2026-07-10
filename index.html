@@ -1952,6 +1952,9 @@ async function downloadDriveOrLocalFiles(files){
   }
 }
 var _cloudReady  = false;
+var _lastCloudError = null; /* real error text from the most recent failed
+                                cloud read — surfaced in the banner instead
+                                of a generic, unreadable message */
 var _sbSaving    = false;
 var _sbLastSave  = 0;
 var _sbSavePending = false; /* an edit arrived while a save was already in flight —
@@ -1960,6 +1963,9 @@ var _sbSavePending = false; /* an edit arrived while a save was already in fligh
 var _useRpcSave  = null;    /* null = not tested yet, true = fast single-round-trip
                                 path available, false = use the classic 2-step path.
                                 See the upsert_tracker_data_if_newer() SQL function. */
+var _realtimeFailStreak = 0; /* consecutive CHANNEL_ERROR/TIMED_OUT/CLOSED events —
+                                 used to back off reconnect attempts instead of
+                                 hammering a persistently broken connection */
 var _lastLocalEdit = 0;
 var _autoSaveTmr = null;
 var _realtimeCh  = null;
@@ -2049,10 +2055,42 @@ function _lsLoadLog(){
    SAVE-ERROR BANNER — visible alert when cloud save fails
 ══════════════════════════════════════════ */
 var _saveFailBanner = null;
+var _realtimeBanner = null;
+
+/* Shown only after several reconnect attempts fail in a row, so a
+   normal single blip (Wi-Fi to mobile data, tab resume, etc.) doesn't
+   nag the user — but a genuinely stuck connection becomes visible with
+   its real reason, instead of being invisible inside the tiny
+   nowrap topbar badge (which clips long text). Auto-save/auto-reload
+   keep working via the 12s/30s polling fallback either way; this is
+   purely informational. */
+function _showRealtimeIssueBanner(msg){
+  if(!_realtimeBanner){
+    _realtimeBanner = document.createElement('div');
+    _realtimeBanner.id = 'realtime-issue-banner';
+    _realtimeBanner.style.cssText = [
+      'position:fixed','bottom:16px','left:50%','transform:translateX(-50%)',
+      'background:#7A5A00','color:#fff','font-size:13.5px','font-weight:700',
+      'padding:12px 20px','border-radius:10px','z-index:8990',
+      'display:flex','align-items:center','gap:12px',
+      'box-shadow:0 6px 24px rgba(0,0,0,.4)',
+      'max-width:calc(100vw - 32px)','flex-wrap:wrap','justify-content:center'
+    ].join(';');
+    document.body.appendChild(_realtimeBanner);
+  }
+  _realtimeBanner.innerHTML =
+    '⚠️ <span>' + (msg||'Live updates having trouble reconnecting. Your data is still being saved and polled every few seconds.') + '</span>' +
+    '<button onclick="manualRefreshSync()" style="background:#fff;color:#7A5A00;border:none;border-radius:6px;padding:6px 14px;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap">🔄 Retry Now</button>' +
+    '<button onclick="_hideRealtimeIssueBanner()" style="background:transparent;color:rgba(255,255,255,.7);border:none;font-size:19px;cursor:pointer;padding:0 4px;line-height:1">×</button>';
+  _realtimeBanner.style.display = 'flex';
+}
+function _hideRealtimeIssueBanner(){
+  if(_realtimeBanner) _realtimeBanner.style.display = 'none';
+}
 var _cloudSaveFailed = false;
 var _retryTmr = null;
 
-function _showSaveErrorBanner(msg){
+function _showSaveErrorBanner(msg, retryFn){
   _cloudSaveFailed = true;
   if(!_saveFailBanner){
     _saveFailBanner = document.createElement('div');
@@ -2069,11 +2107,27 @@ function _showSaveErrorBanner(msg){
   }
   _saveFailBanner.innerHTML =
     '⚠️ <span>' + (msg||'Cloud save failed — your data is safe locally.') + '</span>' +
-    '<button onclick="manualSaveRetry()" style="background:#fff;color:#9A1F1F;border:none;border-radius:6px;padding:6px 14px;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap">🔄 Retry Now</button>' +
+    '<button onclick="'+(retryFn||'manualSaveRetry')+'()" style="background:#fff;color:#9A1F1F;border:none;border-radius:6px;padding:6px 14px;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap">🔄 Retry Now</button>' +
     '<button onclick="_dismissSaveBanner()" style="background:transparent;color:rgba(255,255,255,.7);border:none;font-size:19px;cursor:pointer;padding:0 4px;line-height:1">×</button>';
   _saveFailBanner.style.display = 'flex';
   clearTimeout(_retryTmr);
   _retryTmr = setTimeout(function(){ if(_cloudSaveFailed) saveToCloud(); }, 8000);
+}
+
+/* Retries the initial cloud load specifically — doesn't require being
+   logged in yet, unlike manualSaveRetry(), since a load failure can
+   happen before anyone has picked a role/name. */
+async function retryCloudLoadFromBanner(){
+  _showStatus('⏳ Retrying…', 'var(--amber)');
+  _cloudLoad(function(status){
+    if(status === 'loaded' || status === 'cloud-empty'){
+      _hideSaveErrorBanner();
+      _showStatus('☁ Connected', 'var(--green)');
+      renderAll();
+    } else {
+      _showSaveErrorBanner('Could not reach the cloud (' + (_lastCloudError||'unknown error') + '). Showing this device\'s last saved copy — tap Retry once you\'re back online.', 'retryCloudLoadFromBanner');
+    }
+  });
 }
 
 function _hideSaveErrorBanner(){
@@ -2238,7 +2292,7 @@ async function _saveToCloudLegacy(){
   } catch(e){
     console.warn('Cloud save failed:', e.message, e);
     _showStatus('⚠️ Cloud error — saved locally', 'var(--red)');
-    _showSaveErrorBanner('Cloud save failed — your data is kept safely on this device. Tap Retry.');
+    _showSaveErrorBanner('Cloud save failed (' + (e.message||e.code||'unknown error') + ') — your data is kept safely on this device. Tap Retry.');
   }
 }
 
@@ -2285,6 +2339,7 @@ async function _cloudLoad(cb){
     /* Cloud query FAILED — NOT the same as empty. Never treat this as a
        reason to seed demo data and overwrite real data. */
     console.warn('Cloud load failed (will retry later, not treated as empty):', e.message);
+    _lastCloudError = e.message || e.code || 'unknown error';
     var lsOk2 = _lsLoad();
     cb(lsOk2 && acts.length > 0 ? 'loaded' : 'cloud-error');
   }
@@ -2377,7 +2432,7 @@ function _startSync(){
         setTimeout(function(){ _showStatus('☁ Live', 'var(--green)'); }, 2000);
       }
     )
-    .subscribe(function(status){
+    .subscribe(function(status, err){
       /* If the websocket errors out, times out, or gets closed (common
          on mobile networks — carrier NAT timeouts, background throttling,
          switching between wifi/cellular), automatically reconnect rather
@@ -2386,9 +2441,27 @@ function _startSync(){
          immediate pull-reconcile so anything missed during the gap gets
          picked up right away. */
       if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'){
+        _realtimeFailStreak = (_realtimeFailStreak||0) + 1;
+        var detail = (err && (err.message||err.toString())) || status;
+        console.warn('Realtime channel problem ('+_realtimeFailStreak+' in a row):', detail);
+        /* Back off after repeated failures instead of retrying every 1.5s
+           forever — a fast infinite retry loop is exactly what makes a
+           persistent problem (e.g. Realtime not enabled on the table, or
+           a permissions issue) look like it's "stuck reconnecting" with
+           no way to tell what's actually wrong. Data still stays in sync
+           either way via the 12s/30s polling fallback below. */
+        var delay = Math.min(1500 * Math.pow(1.6, Math.min(_realtimeFailStreak-1, 6)), 30000);
         _showStatus('⚠️ Realtime reconnecting…', 'var(--amber)');
-        setTimeout(function(){ _reconcileFromCloud(true); _restartRealtime(); }, 1500);
+        /* The topbar badge is nowrap/narrow and clips long text, so after
+           a few failures in a row, surface the real reason in a proper
+           wrapping banner instead of a status line nobody can read. */
+        if(_realtimeFailStreak >= 3){
+          _showRealtimeIssueBanner('Live updates disconnected (' + detail + '). Still saving normally — tap Retry to force a reconnect.');
+        }
+        setTimeout(function(){ _reconcileFromCloud(true); _restartRealtime(); }, delay);
       } else if(status === 'SUBSCRIBED'){
+        _realtimeFailStreak = 0;
+        _hideRealtimeIssueBanner();
         _reconcileFromCloud(true);
       }
     });
@@ -2541,11 +2614,12 @@ function initCloud(){
         _showStatus('💾 Initialized with sample data', 'var(--amber)');
       } else {
         _showStatus('⚠️ No data found — check connection!', 'var(--red)');
-        _showSaveErrorBanner('No data found on this device or in the cloud. If you expect data, please do not save yet — reload first or contact support.');
+        _showSaveErrorBanner('No data found on this device or in the cloud. If you expect data, please do not save yet — reload first or contact support.', 'retryCloudLoadFromBanner');
       }
     } else {
       /* status === 'cloud-error' — never seed here, just retry quietly */
       _showStatus('⚠️ Cloud unreachable — using local copy', 'var(--red)');
+      _showSaveErrorBanner('Could not reach the cloud on startup (' + (_lastCloudError||'unknown error') + '). Showing this device\'s last saved copy — tap Retry once you\'re back online.', 'retryCloudLoadFromBanner');
     }
     if(isDark) document.body.classList.add('dark');
     setThisWeek();
