@@ -2148,10 +2148,20 @@ async function _saveToCloudViaRpc(){
       p_id: 'main-data', p_payload: payload, p_rev: _rev
     });
     if(error){
-      const missing = error.code === 'PGRST202' || error.code === '42883' ||
-        /function .*upsert_tracker_data_if_newer.* does not exist/i.test(error.message||'');
-      if(missing){ _useRpcSave = false; return false; }
-      throw error;
+      /* ANY problem with the fast path — function not created yet, no
+         EXECUTE grant for the anon/publishable key, a schema-cache
+         hiccup, anything — must NEVER surface as a save failure on its
+         own. Just fall back to the classic, always-available save
+         method below and let IT be the one to decide whether the save
+         truly failed. Only permanently stop retrying the fast path if
+         it's clearly because the SQL function doesn't exist at all;
+         for any other error, try it again next save (cheap) in case
+         it was transient or gets fixed (e.g. a grant added later). */
+      const permanentlyMissing = error.code === 'PGRST202' || error.code === '42883' ||
+        /schema cache|does not exist|could not find the function/i.test(error.message||'');
+      if(permanentlyMissing) _useRpcSave = false;
+      console.warn('Fast-path cloud save unavailable this round, falling back:', error.message);
+      return false;
     }
     _useRpcSave = true;
     const row = Array.isArray(data) ? data[0] : data;
@@ -2173,10 +2183,8 @@ async function _saveToCloudViaRpc(){
     }
     return true;
   }catch(e){
-    console.warn('Cloud save failed:', e.message, e);
-    _showStatus('⚠️ Cloud error — saved locally', 'var(--red)');
-    _showSaveErrorBanner('Cloud save failed — your data is kept safely on this device. Tap Retry.');
-    return true;
+    console.warn('Fast-path cloud save unavailable this round, falling back:', e.message);
+    return false;
   }
 }
 
