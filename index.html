@@ -3,9 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
 <title>Engineering Activity Tracker</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1563,7 +1560,7 @@ thead .zg-col-task,thead .zg-col-lead,thead .zg-col-progress,thead .zg-col-start
      https://supabase.com/dashboard → Project Settings → API
 ═══════════════════════════════════════════════════════════ */
 const SUPABASE_URL  = 'https://brnckbykyagkdpakeeif.supabase.co';
-const SUPABASE_ANON = 'sb_publishable_RDGtDkP53DxvPSwTKonhJQ_6trymTx2';
+const SUPABASE_ANON = 'sb_publishable_nwh4s7E5N3_sg6Vnw_fu2A_b_TTcwhc';
 
 const _supa = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
@@ -1761,12 +1758,8 @@ async function _buildDriveFolderChain(actType, activityName, category, token){
 }
 
 /* Uploads a file's bytes to Google Drive via a resumable
-   session (works for files of any size in one PUT call).
-   onProgress(pct) — 0..100 — is called as the PUT streams, using
-   XMLHttpRequest (fetch has no upload-progress event) so callers
-   can show a live per-file percentage instead of a single
-   "uploading…" message with no indication of how far along it is. */
-async function _driveApiUploadFile(file, folderId, token, onProgress){
+   session (works for files of any size in one PUT call). */
+async function _driveApiUploadFile(file, folderId, token){
   const initRes=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable',{
     method:'POST',
     headers:{
@@ -1780,27 +1773,9 @@ async function _driveApiUploadFile(file, folderId, token, onProgress){
   if(!initRes.ok) throw new Error('Could not start Google Drive upload session');
   const uploadUrl=initRes.headers.get('Location');
   if(!uploadUrl) throw new Error('Google Drive did not return an upload URL');
-  return await new Promise((resolve,reject)=>{
-    const xhr=new XMLHttpRequest();
-    xhr.open('PUT',uploadUrl,true);
-    xhr.setRequestHeader('Content-Type',file.type||'application/octet-stream');
-    if(xhr.upload && onProgress){
-      xhr.upload.onprogress=ev=>{
-        if(ev.lengthComputable) onProgress(Math.round((ev.loaded/ev.total)*100));
-      };
-    }
-    xhr.onload=()=>{
-      if(xhr.status>=200 && xhr.status<300){
-        if(onProgress) onProgress(100);
-        try{ resolve(JSON.parse(xhr.responseText)); }
-        catch(e){ resolve({}); }
-      } else {
-        reject(new Error(`Google Drive upload failed (${xhr.status})`));
-      }
-    };
-    xhr.onerror=()=>reject(new Error('Google Drive upload failed (network error)'));
-    xhr.send(file);
-  });
+  const putRes=await fetch(uploadUrl,{method:'PUT',headers:{'Content-Type':file.type||'application/octet-stream'},body:file});
+  if(!putRes.ok) throw new Error(`Google Drive upload failed (${putRes.status})`);
+  return await putRes.json();
 }
 
 /* Shares the uploaded file as "anyone with the link can view"
@@ -1819,19 +1794,18 @@ async function _makeDriveFilePublic(fileId, token){
 /* Uploads one file into the signed-in user's Google Drive,
    sorted by Activity Type → Activity Name → Category. Always
    resolves (never rejects) — falls back to a local base64 copy
-   if Google Drive isn't available for any reason.
-   onProgress(pct) — 0..100 — reports live upload progress for
-   this single file (see _driveApiUploadFile). */
-async function uploadFileToDrive(file, actType, activityName, category, onProgress){
+   if Google Drive isn't available for any reason. */
+async function uploadFileToDrive(file, actType, activityName, category){
   try{
     const token=await _getDriveToken();
     const folderId=await _buildDriveFolderChain(actType,activityName,category,token);
-    const created=await _driveApiUploadFile(file,folderId,token,onProgress);
+    const created=await _driveApiUploadFile(file,folderId,token);
     await _makeDriveFilePublic(created.id,token);
     return {name:file.name,itemId:created.id,folder:`${DRIVE_ROOT_FOLDER}/${_slugify(actType||'General')}/${_slugify(activityName||'Untitled')}/${_slugify(category||'files')}`,type:file.type||'',driveStored:true};
   }catch(err){
     console.error('Google Drive upload failed, keeping a local copy instead:',err);
-    return {name:file.name,data:await _readAsDataURL(file),type:file.type||'',driveStored:false,driveError:(err&&err.message)||'Upload failed'};
+    const dataUrl=await _readAsDataURL(file);
+    return {name:file.name,data:dataUrl,type:file.type||'',driveStored:false};
   }
 }
 
@@ -1847,59 +1821,11 @@ async function deleteFileFromDrive(itemId){
 
 /* Uploads a whole FileList into Google Drive under one
    activity/category. Sequential (not parallel) so token
-   acquisition/sign-in popups don't race each other.
-   onFileProgress(index, total, file, phase, pct) — if given — is
-   called for each file so the UI can show which file is uploading
-   and how far along it is, instead of one generic "uploading…"
-   message for the whole batch. phase is one of:
-     'start'    — about to upload this file (pct is 0)
-     'progress' — mid-upload, pct is 0..100
-     'done'     — this file landed in Google Drive
-     'fallback' — Drive upload failed, a local copy was kept instead */
-async function uploadFilesToDrive(fileList, actType, activityName, category, onFileProgress){
-  const files=[...fileList];
+   acquisition/sign-in popups don't race each other. */
+async function uploadFilesToDrive(fileList, actType, activityName, category){
   const out=[];
-  for(let i=0;i<files.length;i++){
-    const f=files[i];
-    if(onFileProgress) onFileProgress(i,files.length,f,'start',0);
-    const result=await uploadFileToDrive(f,actType,activityName,category,
-      onFileProgress?(pct)=>onFileProgress(i,files.length,f,'progress',pct):null);
-    if(onFileProgress) onFileProgress(i,files.length,f,result.driveStored?'done':'fallback',100);
-    out.push(result);
-  }
+  for(const f of [...fileList]) out.push(await uploadFileToDrive(f,actType,activityName,category));
   return out;
-}
-
-/* Human-readable text/color for a single file's upload phase —
-   the ready-made onFileProgress callback most call sites want:
-     uploadFilesToDrive(files,...,_showDriveUploadProgress) */
-function _driveProgressText(i,total,file,phase,pct){
-  const n=i+1;
-  const nm=(file&&file.name)||'file';
-  const short=nm.length>22?nm.slice(0,20)+'…':nm;
-  if(phase==='start')    return `⬆️ Uploading ${n}/${total} to Google Drive — ${short}…`;
-  if(phase==='progress') return `⬆️ Uploading ${n}/${total} to Google Drive — ${short} (${pct}%)`;
-  if(phase==='done')     return `✔ ${n}/${total} saved to Google Drive — ${short}`;
-  if(phase==='fallback') return `⚠️ ${n}/${total} — ${short} saved locally (Drive upload failed)`;
-  return '';
-}
-function _driveProgressColor(phase){
-  return phase==='fallback' ? 'var(--amber)' : phase==='done' ? 'var(--green)' : 'var(--blue)';
-}
-function _showDriveUploadProgress(i,total,file,phase,pct){
-  _showStatus(_driveProgressText(i,total,file,phase,pct), _driveProgressColor(phase));
-}
-
-/* Final "N saved to Drive, M saved locally" summary for a finished
-   batch, so a partial failure is never silently reported as if
-   every file made it to Google Drive. */
-function _driveUploadSummary(uploaded){
-  const total=uploaded.length;
-  const local=uploaded.filter(f=>!f.driveStored).length;
-  if(total===0) return {msg:'',color:'var(--green)'};
-  if(local===0) return {msg:`✔ ${total} file${total===1?'':'s'} saved to Google Drive`,color:'var(--green)'};
-  if(local===total) return {msg:`⚠️ ${total} file${total===1?'':'s'} saved locally — Google Drive upload failed`,color:'var(--amber)'};
-  return {msg:`⚠️ ${total-local}/${total} saved to Google Drive, ${local} saved locally (Drive upload failed)`,color:'var(--amber)'};
 }
 
 /* Builds a direct Google Drive URL for viewing/embedding or
@@ -1952,20 +1878,8 @@ async function downloadDriveOrLocalFiles(files){
   }
 }
 var _cloudReady  = false;
-var _lastCloudError = null; /* real error text from the most recent failed
-                                cloud read — surfaced in the banner instead
-                                of a generic, unreadable message */
 var _sbSaving    = false;
 var _sbLastSave  = 0;
-var _sbSavePending = false; /* an edit arrived while a save was already in flight —
-                                flush it the instant the current save finishes instead
-                                of waiting for the next debounce/30s safety net */
-var _useRpcSave  = null;    /* null = not tested yet, true = fast single-round-trip
-                                path available, false = use the classic 2-step path.
-                                See the upsert_tracker_data_if_newer() SQL function. */
-var _realtimeFailStreak = 0; /* consecutive CHANNEL_ERROR/TIMED_OUT/CLOSED events —
-                                 used to back off reconnect attempts instead of
-                                 hammering a persistently broken connection */
 var _lastLocalEdit = 0;
 var _autoSaveTmr = null;
 var _realtimeCh  = null;
@@ -2003,8 +1917,6 @@ function _showStatus(msg, color){
    devices with skewed clocks and can cause a real edit to be
    discarded in favor of stale data. */
 var _rev = 0;
-var _lastSavedRev = 0; /* _rev value as of the last successful cloud save — lets us
-                           skip network calls entirely when nothing changed */
 const LS_SEEDED_FLAG = 'lean_tracker_seeded_v1';
 
 function _bumpRev(){ _rev++; return _rev; }
@@ -2055,42 +1967,10 @@ function _lsLoadLog(){
    SAVE-ERROR BANNER — visible alert when cloud save fails
 ══════════════════════════════════════════ */
 var _saveFailBanner = null;
-var _realtimeBanner = null;
-
-/* Shown only after several reconnect attempts fail in a row, so a
-   normal single blip (Wi-Fi to mobile data, tab resume, etc.) doesn't
-   nag the user — but a genuinely stuck connection becomes visible with
-   its real reason, instead of being invisible inside the tiny
-   nowrap topbar badge (which clips long text). Auto-save/auto-reload
-   keep working via the 12s/30s polling fallback either way; this is
-   purely informational. */
-function _showRealtimeIssueBanner(msg){
-  if(!_realtimeBanner){
-    _realtimeBanner = document.createElement('div');
-    _realtimeBanner.id = 'realtime-issue-banner';
-    _realtimeBanner.style.cssText = [
-      'position:fixed','bottom:16px','left:50%','transform:translateX(-50%)',
-      'background:#7A5A00','color:#fff','font-size:13.5px','font-weight:700',
-      'padding:12px 20px','border-radius:10px','z-index:8990',
-      'display:flex','align-items:center','gap:12px',
-      'box-shadow:0 6px 24px rgba(0,0,0,.4)',
-      'max-width:calc(100vw - 32px)','flex-wrap:wrap','justify-content:center'
-    ].join(';');
-    document.body.appendChild(_realtimeBanner);
-  }
-  _realtimeBanner.innerHTML =
-    '⚠️ <span>' + (msg||'Live updates having trouble reconnecting. Your data is still being saved and polled every few seconds.') + '</span>' +
-    '<button onclick="manualRefreshSync()" style="background:#fff;color:#7A5A00;border:none;border-radius:6px;padding:6px 14px;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap">🔄 Retry Now</button>' +
-    '<button onclick="_hideRealtimeIssueBanner()" style="background:transparent;color:rgba(255,255,255,.7);border:none;font-size:19px;cursor:pointer;padding:0 4px;line-height:1">×</button>';
-  _realtimeBanner.style.display = 'flex';
-}
-function _hideRealtimeIssueBanner(){
-  if(_realtimeBanner) _realtimeBanner.style.display = 'none';
-}
 var _cloudSaveFailed = false;
 var _retryTmr = null;
 
-function _showSaveErrorBanner(msg, retryFn){
+function _showSaveErrorBanner(msg){
   _cloudSaveFailed = true;
   if(!_saveFailBanner){
     _saveFailBanner = document.createElement('div');
@@ -2107,27 +1987,11 @@ function _showSaveErrorBanner(msg, retryFn){
   }
   _saveFailBanner.innerHTML =
     '⚠️ <span>' + (msg||'Cloud save failed — your data is safe locally.') + '</span>' +
-    '<button onclick="'+(retryFn||'manualSaveRetry')+'()" style="background:#fff;color:#9A1F1F;border:none;border-radius:6px;padding:6px 14px;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap">🔄 Retry Now</button>' +
+    '<button onclick="manualSaveRetry()" style="background:#fff;color:#9A1F1F;border:none;border-radius:6px;padding:6px 14px;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap">🔄 Retry Now</button>' +
     '<button onclick="_dismissSaveBanner()" style="background:transparent;color:rgba(255,255,255,.7);border:none;font-size:19px;cursor:pointer;padding:0 4px;line-height:1">×</button>';
   _saveFailBanner.style.display = 'flex';
   clearTimeout(_retryTmr);
   _retryTmr = setTimeout(function(){ if(_cloudSaveFailed) saveToCloud(); }, 8000);
-}
-
-/* Retries the initial cloud load specifically — doesn't require being
-   logged in yet, unlike manualSaveRetry(), since a load failure can
-   happen before anyone has picked a role/name. */
-async function retryCloudLoadFromBanner(){
-  _showStatus('⏳ Retrying…', 'var(--amber)');
-  _cloudLoad(function(status){
-    if(status === 'loaded' || status === 'cloud-empty'){
-      _hideSaveErrorBanner();
-      _showStatus('☁ Connected', 'var(--green)');
-      renderAll();
-    } else {
-      _showSaveErrorBanner('Could not reach the cloud (' + (_lastCloudError||'unknown error') + '). Showing this device\'s last saved copy — tap Retry once you\'re back online.', 'retryCloudLoadFromBanner');
-    }
-  });
 }
 
 function _hideSaveErrorBanner(){
@@ -2153,127 +2017,40 @@ async function saveToCloud(isRetry){
   /* Step 1: Always persist locally — even if cloud fails, data is safe */
   _lsSave();
 
-  if(_sbSaving && !isRetry){
-    /* A save is already in flight. Don't drop this edit on the floor —
-       previously it would just be silently skipped, and the only thing
-       that could push it to the cloud afterwards was the 30s safety-net
-       interval, which is exactly why sync could feel slow (edits made
-       in quick succession while a save was mid-flight could sit for up
-       to 30 seconds before other devices ever saw them). Instead, flag
-       it as pending so the in-flight save re-runs itself immediately —
-       typically well under a second later — the moment it's done. */
-    _sbSavePending = true;
-    return;
-  }
+  if(_sbSaving && !isRetry) return;
   if(!_cloudReady){
     _showStatus('💾 Saved locally (not connected)', 'var(--amber)');
     return;
   }
   _sbSaving = true;
-  _sbSavePending = false;
   _showStatus('⏳ Saving…', 'var(--amber)');
   try {
-    /* Fast path: a single round trip that atomically checks-and-writes
-       in Postgres (see upsert_tracker_data_if_newer in the setup SQL).
-       Falls back automatically to the classic 2-request path below if
-       that SQL function hasn't been created in this Supabase project. */
-    if(_useRpcSave !== false){
-      const handled = await _saveToCloudViaRpc();
-      if(handled) return; // finally{} below still runs
-    }
-    await _saveToCloudLegacy();
-  } finally {
-    _sbSaving = false;
-    if(_sbSavePending){
-      _sbSavePending = false;
-      saveToCloud(); // flush immediately — don't make it wait for the next debounce
-    }
-  }
-}
-
-/* Fast, single-round-trip save path. Returns true once it has fully
-   handled the save (success, adopted-newer, or a real error) — false
-   only when the SQL function itself doesn't exist yet, so the caller
-   knows to fall back to the legacy path. */
-async function _saveToCloudViaRpc(){
-  const payload = { acts, inventory, nid, calY, calM, isDark, projected, _rev, _savedAt: Date.now() };
-  try{
-    const { data, error } = await _supa.rpc('upsert_tracker_data_if_newer', {
-      p_id: 'main-data', p_payload: payload, p_rev: _rev
-    });
-    if(error){
-      /* ANY problem with the fast path — function not created yet, no
-         EXECUTE grant for the anon/publishable key, a schema-cache
-         hiccup, anything — must NEVER surface as a save failure on its
-         own. Just fall back to the classic, always-available save
-         method below and let IT be the one to decide whether the save
-         truly failed. Only permanently stop retrying the fast path if
-         it's clearly because the SQL function doesn't exist at all;
-         for any other error, try it again next save (cheap) in case
-         it was transient or gets fixed (e.g. a grant added later). */
-      const permanentlyMissing = error.code === 'PGRST202' || error.code === '42883' ||
-        /schema cache|does not exist|could not find the function/i.test(error.message||'');
-      if(permanentlyMissing) _useRpcSave = false;
-      console.warn('Fast-path cloud save unavailable this round, falling back:', error.message);
-      return false;
-    }
-    _useRpcSave = true;
-    const row = Array.isArray(data) ? data[0] : data;
-    if(row && row.updated === false){
-      /* Cloud already had something newer — adopt it instead of overwriting */
-      var d = row.current_payload || {};
-      acts=d.acts||[]; inventory=d.inventory||[]; nid=d.nid||1;
-      calY=d.calY||calY; calM=d.calM||calM; isDark=d.isDark||isDark;
-      projected=d.projected||[];
-      _rev = d._rev || _rev; _lastSavedRev = _rev;
-      _lsSave(); renderAll();
-      _hideSaveErrorBanner();
-      _showStatus('🔄 Cloud had newer data — synced instead of overwriting', 'var(--blue)');
-    } else {
-      _sbLastSave = Date.now();
-      _lastSavedRev = _rev;
-      _hideSaveErrorBanner();
-      _showStatus('☁ Synced ' + new Date().toLocaleTimeString(), 'var(--green)');
-    }
-    return true;
-  }catch(e){
-    console.warn('Fast-path cloud save unavailable this round, falling back:', e.message);
-    return false;
-  }
-}
-
-/* Classic 2-request path (select current rev, then upsert). Used
-   automatically until the upsert_tracker_data_if_newer SQL function is
-   added to the Supabase project — see the setup instructions provided
-   alongside this file. Functionally identical to the original save,
-   just factored out so it can serve as an automatic fallback. */
-async function _saveToCloudLegacy(){
-  try {
-    const { data: curRev, error: checkErr } = await _supa
+    /* RECONCILE GUARD — check the cloud's current revision before
+       overwriting it. This is the critical safety check: it's what
+       stops a device that fell behind (e.g. a mobile tab that was
+       backgrounded and missed a realtime update) from blindly pushing
+       its stale snapshot over newer data another device already saved.
+       Every single save — periodic, manual, or auto — goes through
+       this check, so a stale push can never happen regardless of why
+       this device's revision fell behind. */
+    const { data: cur, error: checkErr } = await _supa
       .from('tracker_data')
-      .select('payload->_rev')
+      .select('payload')
       .eq('id', 'main-data')
       .maybeSingle();
-    if(!checkErr && curRev){
-      var cloudRev = curRev._rev || 0;
+    if(!checkErr && cur && cur.payload){
+      var cloudRev = cur.payload._rev || 0;
       if(cloudRev > _rev){
-        const { data: full, error: fullErr } = await _supa
-          .from('tracker_data')
-          .select('payload')
-          .eq('id', 'main-data')
-          .maybeSingle();
-        if(!fullErr && full && full.payload){
-          var d = full.payload;
-          acts=d.acts||[]; inventory=d.inventory||[]; nid=d.nid||1;
-          calY=d.calY||calY; calM=d.calM||calM; isDark=d.isDark||isDark;
-          projected=d.projected||[];
-          _rev = cloudRev;
-          _lastSavedRev = cloudRev;
-          _lsSave();
-          renderAll();
-          _hideSaveErrorBanner();
-          _showStatus('🔄 Cloud had newer data — synced instead of overwriting', 'var(--blue)');
-        }
+        var d = cur.payload;
+        acts=d.acts||[]; inventory=d.inventory||[]; nid=d.nid||1;
+        calY=d.calY||calY; calM=d.calM||calM; isDark=d.isDark||isDark;
+        projected=d.projected||[];
+        _rev = cloudRev;
+        _lsSave();
+        renderAll();
+        _hideSaveErrorBanner();
+        _showStatus('🔄 Cloud had newer data — synced instead of overwriting', 'var(--blue)');
+        _sbSaving = false;
         return;
       }
     }
@@ -2286,14 +2063,13 @@ async function _saveToCloudLegacy(){
       }, { onConflict: 'id' });
     if(error) throw error;
     _sbLastSave = Date.now();
-    _lastSavedRev = _rev;
     _hideSaveErrorBanner();
     _showStatus('☁ Synced ' + new Date().toLocaleTimeString(), 'var(--green)');
   } catch(e){
     console.warn('Cloud save failed:', e.message, e);
     _showStatus('⚠️ Cloud error — saved locally', 'var(--red)');
-    _showSaveErrorBanner('Cloud save failed (' + (e.message||e.code||'unknown error') + ') — your data is kept safely on this device. Tap Retry.');
-  }
+    _showSaveErrorBanner('Cloud save failed — your data is kept safely on this device. Tap Retry.');
+  } finally { _sbSaving = false; }
 }
 
 /* ══════════════════════════════════════════
@@ -2339,7 +2115,6 @@ async function _cloudLoad(cb){
     /* Cloud query FAILED — NOT the same as empty. Never treat this as a
        reason to seed demo data and overwrite real data. */
     console.warn('Cloud load failed (will retry later, not treated as empty):', e.message);
-    _lastCloudError = e.message || e.code || 'unknown error';
     var lsOk2 = _lsLoad();
     cb(lsOk2 && acts.length > 0 ? 'loaded' : 'cloud-error');
   }
@@ -2432,59 +2207,7 @@ function _startSync(){
         setTimeout(function(){ _showStatus('☁ Live', 'var(--green)'); }, 2000);
       }
     )
-    .subscribe(function(status, err){
-      /* If the websocket errors out, times out, or gets closed (common
-         on mobile networks — carrier NAT timeouts, background throttling,
-         switching between wifi/cellular), automatically reconnect rather
-         than leaving this device silently stuck with a dead channel
-         until the user happens to background/reopen the tab. Also do an
-         immediate pull-reconcile so anything missed during the gap gets
-         picked up right away. */
-      if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'){
-        _realtimeFailStreak = (_realtimeFailStreak||0) + 1;
-        var detail = (err && (err.message||err.toString())) || status;
-        /* Log the raw error too — a bare "CLOSED" with no err object tells
-           us almost nothing on its own, but the full object sometimes has
-           a nested reason (auth rejection code, close code, etc.) that
-           .message alone doesn't surface. */
-        console.warn('Realtime channel problem ('+_realtimeFailStreak+' in a row):', detail, err||'(no error object — likely a plain socket close)');
-        /* On the very first failure, run a one-time plain REST probe
-           against the same project using the same key. This tells us
-           whether the key/auth itself is bad (REST call also fails,
-           e.g. 401) vs. the key being fine and only the WebSocket/
-           realtime channel being blocked (REST succeeds, only this
-           fails) — e.g. a corporate proxy or firewall blocking wss://
-           while https:// still works fine. */
-        if(_realtimeFailStreak === 1){
-          fetch(SUPABASE_URL + '/rest/v1/tracker_data?select=id&limit=1', {
-            headers: { apikey: SUPABASE_ANON, Authorization: 'Bearer ' + SUPABASE_ANON }
-          }).then(function(r){
-            console.warn('Realtime REST probe (diagnostic only):', r.status, r.ok ? 'REST OK — key is valid, problem is WebSocket/realtime-specific' : 'REST FAILED — key/auth itself is the problem');
-          }).catch(function(e){
-            console.warn('Realtime REST probe failed to even reach the server:', e.message, '— likely a network/DNS/firewall issue, not a key problem');
-          });
-        }
-        /* Back off after repeated failures instead of retrying every 1.5s
-           forever — a fast infinite retry loop is exactly what makes a
-           persistent problem (e.g. Realtime not enabled on the table, or
-           a permissions issue) look like it's "stuck reconnecting" with
-           no way to tell what's actually wrong. Data still stays in sync
-           either way via the 12s/30s polling fallback below. */
-        var delay = Math.min(1500 * Math.pow(1.6, Math.min(_realtimeFailStreak-1, 6)), 30000);
-        _showStatus('⚠️ Realtime reconnecting…', 'var(--amber)');
-        /* The topbar badge is nowrap/narrow and clips long text, so after
-           a few failures in a row, surface the real reason in a proper
-           wrapping banner instead of a status line nobody can read. */
-        if(_realtimeFailStreak >= 3){
-          _showRealtimeIssueBanner('Live updates disconnected (' + detail + '). Still saving normally — tap Retry to force a reconnect.');
-        }
-        setTimeout(function(){ _reconcileFromCloud(true); _restartRealtime(); }, delay);
-      } else if(status === 'SUBSCRIBED'){
-        _realtimeFailStreak = 0;
-        _hideRealtimeIssueBanner();
-        _reconcileFromCloud(true);
-      }
-    });
+    .subscribe();
 }
 
 /* Mobile browsers (and backgrounded desktop tabs) suspend or kill the
@@ -2506,36 +2229,23 @@ async function _reconcileFromCloud(silent){
     return;
   }
   try{
-    /* Cheap check first — only ask for the `_rev` number. This runs on
-       every tab focus / reconnect, so avoiding a full-payload download
-       here (when nothing has actually changed, which is the common
-       case) is a major egress saving. */
-    const { data: curRev, error } = await _supa
+    const { data, error } = await _supa
       .from('tracker_data')
-      .select('payload->_rev')
+      .select('payload')
       .eq('id', 'main-data')
       .maybeSingle();
     if(error) throw error;
-    if(curRev){
-      var cloudRev = curRev._rev || 0;
+    if(data && data.payload){
+      var d = data.payload;
+      var cloudRev = d._rev || 0;
       if(cloudRev > _rev){
-        const { data, error: fullErr } = await _supa
-          .from('tracker_data')
-          .select('payload')
-          .eq('id', 'main-data')
-          .maybeSingle();
-        if(fullErr) throw fullErr;
-        if(data && data.payload){
-          var d = data.payload;
-          acts=d.acts||[]; inventory=d.inventory||[]; nid=d.nid||1;
-          calY=d.calY||calY; calM=d.calM||calM; isDark=d.isDark||isDark;
-          projected=d.projected||[];
-          _rev = cloudRev;
-          _lastSavedRev = cloudRev;
-          _lsSave();
-          renderAll();
-          if(!silent) _showStatus('🔄 Synced latest data from cloud', 'var(--blue)');
-        }
+        acts=d.acts||[]; inventory=d.inventory||[]; nid=d.nid||1;
+        calY=d.calY||calY; calM=d.calM||calM; isDark=d.isDark||isDark;
+        projected=d.projected||[];
+        _rev = cloudRev;
+        _lsSave();
+        renderAll();
+        if(!silent) _showStatus('🔄 Synced latest data from cloud', 'var(--blue)');
       } else if(!silent){
         _showStatus('☁ Already up to date', 'var(--green)');
       }
@@ -2634,54 +2344,27 @@ function initCloud(){
         _showStatus('💾 Initialized with sample data', 'var(--amber)');
       } else {
         _showStatus('⚠️ No data found — check connection!', 'var(--red)');
-        _showSaveErrorBanner('No data found on this device or in the cloud. If you expect data, please do not save yet — reload first or contact support.', 'retryCloudLoadFromBanner');
+        _showSaveErrorBanner('No data found on this device or in the cloud. If you expect data, please do not save yet — reload first or contact support.');
       }
     } else {
       /* status === 'cloud-error' — never seed here, just retry quietly */
       _showStatus('⚠️ Cloud unreachable — using local copy', 'var(--red)');
-      _showSaveErrorBanner('Could not reach the cloud on startup (' + (_lastCloudError||'unknown error') + '). Showing this device\'s last saved copy — tap Retry once you\'re back online.', 'retryCloudLoadFromBanner');
     }
     if(isDark) document.body.classList.add('dark');
     setThisWeek();
     _cloudLoadLog(function(){
       _cloudReady = true;
-      _cloudLoadAdminUsers(function(){ renderAdminNamePicker(); _cloudLoadPinHashes(); });
+      _cloudLoadAdminUsers(function(){ renderAdminNamePicker(); });
       _startSync();
       /* Only render if user is already logged in */
       if(currentUser) renderAll();
       /* Public rating-form link (?rate=<id>) — render as soon as data is ready */
       var _rateParam = new URLSearchParams(location.search).get('rate');
       if(_rateParam) renderRatingForm(_rateParam);
-      /* Periodic auto-save safety net — every 30s, but ONLY if there's
-         an actual unsaved change (_rev has moved on since the last
-         successful save). Previously this fired unconditionally every
-         10s from every open tab/device, each time doing a full read +
-         write of the entire dataset — that alone can add up to
-         thousands of full-payload round trips a day and was the
-         single biggest driver of egress usage. The debounced save in
-         scheduleAutoSave() (500ms after an edit) plus the flush-on-hide
-         /pagehide/beforeunload handlers already cover normal saving;
-         this interval only exists to catch anything that slipped
-         through, so it's safe to make it both slower and conditional. */
-      setInterval(function(){
-        if(_cloudReady && !_cloudSaveFailed && _rev > _lastSavedRev) saveToCloud();
-      }, 30000);
+      /* Periodic auto-save every 30s (only when save is healthy) */
+      setInterval(function(){ if(_cloudReady && !_cloudSaveFailed) saveToCloud(); }, 10000);
       /* Retry every 15s when cloud save has been failing */
       setInterval(function(){ if(_cloudReady && _cloudSaveFailed) saveToCloud(true); }, 15000);
-      /* FOREGROUND POLL FALLBACK — mobile browsers (Safari/Chrome on iOS
-         & Android especially) frequently freeze or silently drop the
-         realtime websocket while a tab just sits open in the
-         foreground, with no visibilitychange/offline event ever firing
-         to warn the app that it went stale. Relying on realtime +
-         reconnect-on-focus alone means a phone that's simply left open
-         can go quietly out of sync indefinitely. This cheap rev-only
-         check (same lightweight query _reconcileFromCloud already uses
-         for tab-focus/online reconnects) runs every 12s while the tab
-         is visible, so any silent drop gets caught within seconds
-         instead of only on the next backgrounding/refresh. */
-      setInterval(function(){
-        if(document.visibilityState === 'visible' && _cloudReady) _reconcileFromCloud(true);
-      }, 12000);
       document.addEventListener('keydown', function(e){
         /* PIN keyboard support — enter PIN screen */
         if(document.getElementById('pin-screen') &&
@@ -2746,8 +2429,7 @@ let currentRole = null;   // 'admin' | 'viewer'
 let _pendingUser = null;
 let _pendingRole = null;  // role chosen at step 1
 const LOG_KEY = 'lean_tracker_loginlog_v1';
-const PIN_KEY_PREFIX = 'lean_pin_';           // legacy per-device key (read-only now, kept only for migration)
-const PIN_HASHES_CACHE_KEY = 'lean_pinhashes_cache_v1';
+const PIN_KEY_PREFIX = 'lean_pin_';
 let loginLog = [];
 
 /* ══════════════════════════════════════════
@@ -2882,9 +2564,7 @@ async function removeAdminUser(name){
   if(name === MAIN_ADMIN){ alert('The Main Admin cannot be removed.'); return; }
   if(!confirm('Remove '+name+' as an Admin? They will no longer be able to log in with Admin access.')) return;
   adminUsers = adminUsers.filter(u=>u.name !== name);
-  delete pinHashes[name];
   try{ localStorage.removeItem(PIN_KEY_PREFIX+name); }catch(e){}
-  await _cloudSavePinHashes();
   await _cloudSaveAdminUsers();
   renderManageAdminsList();
   renderAdminNamePicker();
@@ -2900,9 +2580,11 @@ async function renameAdminUser(oldName){
   if(!entry) return;
   entry.name = newName;
   entry.initials = _nameToInitials(newName);
-  /* carry the existing PIN hash over to the new name, everywhere (cloud-synced) */
-  if(pinHashes[oldName]){ pinHashes[newName] = pinHashes[oldName]; delete pinHashes[oldName]; }
-  await _cloudSavePinHashes();
+  /* carry the existing PIN over to the new name on this device */
+  try{
+    const oldPin = localStorage.getItem(PIN_KEY_PREFIX+oldName);
+    if(oldPin){ localStorage.setItem(PIN_KEY_PREFIX+newName, oldPin); localStorage.removeItem(PIN_KEY_PREFIX+oldName); }
+  }catch(e){}
   await _cloudSaveAdminUsers();
   renderManageAdminsList();
   renderAdminNamePicker();
@@ -2921,97 +2603,16 @@ async function _hashPin(pin){
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 
-/* ══════════════════════════════════════════
-   PIN STORAGE — now synced through Supabase
-   ─────────────────────────────────────────
-   PINs used to live ONLY in localStorage
-   (PIN_KEY_PREFIX + name), so a PIN set on one
-   device was invisible on any other device —
-   opening the app on a phone for the first time
-   always looked like "no PIN yet" and forced a
-   brand-new PIN to be created there. The hashes
-   (never the raw PIN) now live in the same
-   `tracker_data` table, in a dedicated row
-   (id:'pin-hashes'), so every device shares the
-   same answer to "does this admin already have
-   a PIN, and what is its hash". A local cache is
-   still kept for instant, offline-friendly
-   lookups on devices that have already synced.
-══════════════════════════════════════════ */
-let pinHashes = {};                 // { adminName: sha256Hash }
-let _pinHashesReady = false;
-let _pinHashesWaiters = [];
-function _waitPinHashesReady(){
-  if(_pinHashesReady) return Promise.resolve();
-  return new Promise(function(res){ _pinHashesWaiters.push(res); });
-}
-function _markPinHashesReady(){
-  _pinHashesReady = true;
-  _pinHashesWaiters.forEach(function(r){ r(); });
-  _pinHashesWaiters = [];
-}
-function _loadPinHashesLocalCache(){
-  try{
-    const r = localStorage.getItem(PIN_HASHES_CACHE_KEY);
-    pinHashes = r ? JSON.parse(r) : {};
-  }catch(e){ pinHashes = {}; }
-}
-function _savePinHashesLocalCache(){
-  try{ localStorage.setItem(PIN_HASHES_CACHE_KEY, JSON.stringify(pinHashes)); }catch(e){}
-}
-/* Loads the shared PIN-hash table from the cloud. Also migrates any
-   OLD per-device PIN (set before this update existed) into the shared
-   table, so nobody who already set a PIN gets locked out — but only
-   for names the cloud doesn't already know about, so a PIN changed on
-   another device always wins over a stale local leftover. */
-async function _cloudLoadPinHashes(cb){
-  _loadPinHashesLocalCache();
-  let needsPush = false;
-  try{
-    const { data, error } = await _supa
-      .from('tracker_data')
-      .select('payload')
-      .eq('id', 'pin-hashes')
-      .maybeSingle();
-    const cloudHashes = (!error && data && data.payload && data.payload.hashes) ? data.payload.hashes : null;
-    if(cloudHashes){
-      pinHashes = Object.assign({}, pinHashes, cloudHashes);
-    }
-    // Migrate legacy per-device PINs for names the cloud (still) doesn't know about
-    (adminUsers||[]).forEach(function(u){
-      const known = cloudHashes && cloudHashes[u.name];
-      if(!known){
-        const legacy = localStorage.getItem(PIN_KEY_PREFIX + u.name);
-        if(legacy && pinHashes[u.name] !== legacy){ pinHashes[u.name] = legacy; needsPush = true; }
-      }
-    });
-  }catch(e){ console.warn('PIN cloud load failed, using local cache for now:', e.message); }
-  _savePinHashesLocalCache();
-  _markPinHashesReady();
-  if(needsPush) _cloudSavePinHashes();
-  if(cb) cb();
-}
-async function _cloudSavePinHashes(){
-  _savePinHashesLocalCache();
-  if(typeof _cloudReady === 'undefined' || !_cloudReady) return;
-  try{
-    await _supa.from('tracker_data').upsert({
-      id: 'pin-hashes',
-      payload: { hashes: pinHashes },
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'id' });
-  }catch(e){ console.warn('PIN cloud save failed:', e.message); }
-}
+/* ── PIN storage helpers ── */
 function _hasSavedPin(name){
-  return !!pinHashes[name];
+  return !!localStorage.getItem(PIN_KEY_PREFIX + name);
 }
 function _getSavedPinHash(name){
-  return pinHashes[name] || '';
+  return localStorage.getItem(PIN_KEY_PREFIX + name) || '';
 }
 async function _savePin(name, pin){
   const hash = await _hashPin(pin);
-  pinHashes[name] = hash;
-  await _cloudSavePinHashes();
+  localStorage.setItem(PIN_KEY_PREFIX + name, hash);
 }
 
 /* ── Initials from a name string ── */
@@ -3049,21 +2650,11 @@ function chooseRole(role){
 /* ─────────────────────────────────────────
    STEP 2a: Admin name selected
 ───────────────────────────────────────── */
-async function selectAdminUser(name, initials){
+function selectAdminUser(name, initials){
   _pendingUser = name;
   _hide('step-admin-name');
   document.getElementById('pin-username').textContent = name;
   document.getElementById('set-pin-username').textContent = name;
-  /* If this device already knows the answer for this name (from its
-     local PIN-hash cache) decide instantly. Otherwise — e.g. the very
-     first time this admin logs in on this device — wait briefly for
-     the cloud's shared PIN table, so we don't wrongly show "create a
-     new PIN" just because this device hasn't synced yet. A short
-     timeout keeps things usable even if the device is offline. */
-  if(!_pinHashesReady && !(name in pinHashes)){
-    _showStatus('⏳ Checking your PIN…', 'var(--amber)');
-    await Promise.race([ _waitPinHashesReady(), new Promise(function(r){ setTimeout(r, 6000); }) ]);
-  }
   if(_hasSavedPin(name)){
     _showEnterPin(name);
   } else {
@@ -3604,14 +3195,15 @@ async function handlePhotoUpload(e){
   const files=[...e.target.files];
   e.target.value='';
   if(!files.length)return;
-  const uploaded=await uploadFilesToDrive(files,a.act,a.n,'photos',_showDriveUploadProgress);
+  _showStatus('⬆️ Uploading to Google Drive…','var(--blue)');
+  const uploaded=await uploadFilesToDrive(files,a.act,a.n,'photos');
   /* Photos historically stored as plain strings (data URL). Keep
      that for local base64 fallbacks, but store an object with the
      Google Drive item id when the upload succeeded so it can be
      viewed/removed from Google Drive later. */
   uploaded.forEach(f=>a.photos.push(f.driveStored?{itemId:f.itemId,folder:f.folder,name:f.name}:f.data));
   scheduleAutoSave();renderPhotoGrid(a);
-  const _sum=_driveUploadSummary(uploaded); _showStatus(_sum.msg,_sum.color);
+  _showStatus('✔ Saved to Google Drive','var(--green)');
 }
 
 function renderPhotoGrid(a){
@@ -3684,10 +3276,11 @@ async function handleCompletionUpload(e,cat){
   const files=[...e.target.files];
   e.target.value='';
   if(!files.length)return;
-  const uploaded=await uploadFilesToDrive(files,a.act,a.n,`completion-${cat}`,_showDriveUploadProgress);
+  _showStatus('⬆️ Uploading to Google Drive…','var(--blue)');
+  const uploaded=await uploadFilesToDrive(files,a.act,a.n,`completion-${cat}`);
   uploaded.forEach(f=>pkg[cat].push(f));
   scheduleAutoSave();renderCompletionPkg(a);
-  const _sum=_driveUploadSummary(uploaded); _showStatus(_sum.msg,_sum.color);
+  _showStatus('✔ Saved to Google Drive','var(--green)');
 }
 
 function renderCompletionPkg(a){
@@ -3804,10 +3397,11 @@ async function handleSafetyDocUpload(e){
   const files=[...e.target.files];
   e.target.value='';
   if(!files.length)return;
-  const uploaded=await uploadFilesToDrive(files,a.act,a.n,'safety',_showDriveUploadProgress);
+  _showStatus('⬆️ Uploading to Google Drive…','var(--blue)');
+  const uploaded=await uploadFilesToDrive(files,a.act,a.n,'safety');
   uploaded.forEach(f=>docs.push(f));
   scheduleAutoSave();renderSafetyPkg(a);
-  const _sum=_driveUploadSummary(uploaded); _showStatus(_sum.msg,_sum.color);
+  _showStatus('✔ Saved to Google Drive','var(--green)');
 }
 
 function renderSafetyPkg(a){
@@ -5843,10 +5437,11 @@ async function handleContractorDocUpload(e,i){
   const actType=(document.getElementById('pm-act')||{}).value||'PROJ';
   const activityName=(document.getElementById('pm-name')||{}).value||'New Project';
   const contractorName=pmContractors[i].name||`contractor-${i+1}`;
-  const uploaded=await uploadFilesToDrive(files,actType,activityName,`contractor-${contractorName}`,_showDriveUploadProgress);
+  _showStatus('⬆️ Uploading to Google Drive…','var(--blue)');
+  const uploaded=await uploadFilesToDrive(files,actType,activityName,`contractor-${contractorName}`);
   uploaded.forEach(f=>pmContractors[i].docs.push(f));
   renderContractors();
-  const _sum=_driveUploadSummary(uploaded); _showStatus(_sum.msg,_sum.color);
+  _showStatus('✔ Saved to Google Drive','var(--green)');
 }
 
 function addProjSubRow(){
@@ -5963,10 +5558,11 @@ async function handlePmDocUpload(e,cat){
   const arr=cat==='bom'?pmBOM:pmSOW;
   const actType=(document.getElementById('pm-act')||{}).value||'PROJ';
   const activityName=(document.getElementById('pm-name')||{}).value||'New Project';
-  const uploaded=await uploadFilesToDrive(files,actType,activityName,cat,_showDriveUploadProgress);
+  _showStatus('⬆️ Uploading to Drive…','var(--blue)');
+  const uploaded=await uploadFilesToDrive(files,actType,activityName,cat);
   uploaded.forEach(f=>arr.push(f));
   renderPmDocs();
-  const _sum=_driveUploadSummary(uploaded); _showStatus(_sum.msg,_sum.color);
+  _showStatus('✔ Saved to Drive','var(--green)');
 }
 
 function renderPmDocs(){
